@@ -7520,7 +7520,7 @@ inline SSLServer::~SSLServer() {
   if (ctx_) { SSL_CTX_free(ctx_); }
 }
 
-inline bool SSLServer::is_valid() const { return ctx_; }
+inline bool SSLServer::is_valid() const { return ctx_ ? true : false; }
 
 inline SSL_CTX *SSLServer::ssl_context() const { return ctx_; }
 
@@ -7612,7 +7612,7 @@ inline SSLClient::~SSLClient() {
   shutdown_ssl_impl(socket_, true);
 }
 
-inline bool SSLClient::is_valid() const { return ctx_; }
+inline bool SSLClient::is_valid() const { return ctx_ ? true : false; }
 
 inline void SSLClient::set_ca_cert_store(X509_STORE *ca_cert_store) {
   if (ca_cert_store) {
