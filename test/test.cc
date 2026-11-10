@@ -29431,6 +29431,88 @@ TEST(WebSocketTest, ClientRejectsResponseWithoutUpgradeToken) {
   EXPECT_FALSE(client.is_open());
 }
 
+TEST(WebSocketTest, ConnectReportsRejectionBody) {
+  Server svr;
+  svr.Get("/length", [](const Request &, Response &res) {
+    res.status = StatusCode::Unauthorized_401;
+    res.set_content("{\"error\":\"invalid token\"}", "application/json");
+  });
+  svr.Get("/chunked", [](const Request &, Response &res) {
+    res.status = StatusCode::Forbidden_403;
+    res.set_chunked_content_provider("text/plain",
+                                     [](size_t offset, DataSink &sink) {
+                                       if (offset == 0) {
+                                         sink.write("forbidden: ", 11);
+                                         sink.write("banned", 6);
+                                       }
+                                       sink.done();
+                                       return true;
+                                     });
+  });
+  svr.Get("/large", [](const Request &, Response &res) {
+    res.status = StatusCode::BadRequest_400;
+    res.set_content(
+        std::string(CPPHTTPLIB_WEBSOCKET_HANDSHAKE_BODY_MAX_LENGTH + 100, 'x'),
+        "text/plain");
+  });
+
+  auto port = svr.bind_to_any_port("localhost");
+  std::thread t([&]() { svr.listen_after_bind(); });
+  auto se = detail::scope_exit([&] {
+    svr.stop();
+    t.join();
+  });
+  svr.wait_until_ready();
+
+  const auto base = "ws://localhost:" + std::to_string(port);
+
+  {
+    ws::WebSocketClient client(base + "/length");
+    auto res = client.connect();
+    EXPECT_FALSE(res);
+    EXPECT_EQ(Error::WebSocketHandshake, res.error());
+    EXPECT_EQ(StatusCode::Unauthorized_401, res.status());
+    EXPECT_EQ("application/json", res.get_header_value("Content-Type"));
+    EXPECT_EQ("{\"error\":\"invalid token\"}", res.body());
+  }
+
+  {
+    ws::WebSocketClient client(base + "/chunked");
+    auto res = client.connect();
+    EXPECT_FALSE(res);
+    EXPECT_EQ(StatusCode::Forbidden_403, res.status());
+    EXPECT_EQ("forbidden: banned", res.body());
+  }
+
+  {
+    ws::WebSocketClient client(base + "/large");
+    auto res = client.connect();
+    EXPECT_FALSE(res);
+    EXPECT_EQ(StatusCode::BadRequest_400, res.status());
+    EXPECT_EQ(std::string(CPPHTTPLIB_WEBSOCKET_HANDSHAKE_BODY_MAX_LENGTH, 'x'),
+              res.body());
+  }
+
+  {
+    // A successful upgrade has no body to report
+    Server ok;
+    ok.WebSocket("/ws", [](const Request &, ws::WebSocket &) {});
+    auto ok_port = ok.bind_to_any_port("localhost");
+    std::thread ok_t([&]() { ok.listen_after_bind(); });
+    auto ok_se = detail::scope_exit([&] {
+      ok.stop();
+      ok_t.join();
+    });
+    ok.wait_until_ready();
+
+    ws::WebSocketClient client("ws://localhost:" + std::to_string(ok_port) +
+                               "/ws");
+    auto res = client.connect();
+    EXPECT_TRUE(res);
+    EXPECT_TRUE(res.body().empty());
+  }
+}
+
 TEST(WebSocketTest, ClientRejectsUnofferedSubprotocol) {
   Server svr;
   svr.Get("/ws", [](const Request &req, Response &res) {
@@ -32277,6 +32359,26 @@ TEST(WebSocketProxyTest, ProxyRejectionReportsProxyConnection) {
   EXPECT_EQ("Basic realm=\"proxy\"",
             res.get_header_value("Proxy-Authenticate"));
   EXPECT_FALSE(client.is_open());
+}
+
+TEST(WebSocketProxyTest, ProxyRejectionReportsBody) {
+  proxy_tunnel_test::ScopedWebSocketOrigin origin;
+  proxy_tunnel_test::ScopedConnectProxy proxy(
+      origin.port(), [](const std::string &) -> std::string {
+        return "HTTP/1.1 403 Forbidden\r\n"
+               "Content-Type: text/plain\r\n"
+               "Content-Length: 18\r\n\r\n"
+               "destination denied";
+      });
+  ASSERT_NE(0, proxy.port());
+
+  ws::WebSocketClient client(origin.url());
+  client.set_proxy("127.0.0.1", proxy.port());
+  auto res = client.connect();
+  EXPECT_FALSE(res);
+  EXPECT_EQ(Error::ProxyConnection, res.error());
+  EXPECT_EQ(StatusCode::Forbidden_403, res.status());
+  EXPECT_EQ("destination denied", res.body());
 }
 
 TEST(WebSocketProxyTest, NoProxyBypassesProxy) {

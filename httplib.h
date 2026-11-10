@@ -291,6 +291,13 @@ static_assert(CPPHTTPLIB_MAX_LINE_LENGTH > 0,
 #define CPPHTTPLIB_WEBSOCKET_MAX_MISSED_PONGS 0
 #endif
 
+// How much of the body of a rejected upgrade response (or of a proxy's refusal
+// of CONNECT) WebSocketClient::connect() keeps in ws::Result::body(). A longer
+// body is truncated to this length.
+#ifndef CPPHTTPLIB_WEBSOCKET_HANDSHAKE_BODY_MAX_LENGTH
+#define CPPHTTPLIB_WEBSOCKET_HANDSHAKE_BODY_MAX_LENGTH (64 * 1024) // 64KB
+#endif
+
 /*
  * Headers
  */
@@ -4602,12 +4609,15 @@ enum ReadResult : int { Fail = 0, Text = 1, Binary = 2, Timeout = 3 };
 // upgrade handshake fully succeeded. On failure error() identifies the
 // failing layer; status()/headers() expose the server's upgrade response
 // when one was received (status() is -1 otherwise), or the proxy's reply to
-// CONNECT when error() is ProxyConnection.
+// CONNECT when error() is ProxyConnection. body() holds the body of that
+// response when the upgrade (or CONNECT) was refused with a non-101 (non-2xx)
+// status, truncated to CPPHTTPLIB_WEBSOCKET_HANDSHAKE_BODY_MAX_LENGTH.
 class Result {
 public:
   Result() = default;
-  Result(Error err, int status, Headers &&headers)
-      : err_(err), status_(status), headers_(std::move(headers)) {}
+  Result(Error err, int status, Headers &&headers, std::string &&body = {})
+      : err_(err), status_(status), headers_(std::move(headers)),
+        body_(std::move(body)) {}
 
   explicit operator bool() const { return err_ == Error::Success; }
   Error error() const { return err_; }
@@ -4622,6 +4632,7 @@ public:
   bool has_header(const std::string &key) const {
     return headers_.find(key) != headers_.end();
   }
+  const std::string &body() const { return body_; }
 
 #ifdef CPPHTTPLIB_SSL_ENABLED
   Result(Error err, int status, Headers &&headers, int ssl_error,
@@ -4637,6 +4648,7 @@ private:
   Error err_ = Error::Unknown; // a default-constructed Result is falsy
   int status_ = -1;
   Headers headers_;
+  std::string body_;
 #ifdef CPPHTTPLIB_SSL_ENABLED
   int ssl_error_ = 0;
   uint64_t ssl_backend_error_ = 0;
@@ -8597,6 +8609,7 @@ struct WebSocketUpgradeResponse {
   Error error = Error::Success;
   int status = -1;
   Headers headers;
+  std::string body;
   std::string selected_subprotocol;
 };
 
@@ -10684,6 +10697,32 @@ inline bool write_request_head(Stream &strm, Request &req, Error &error) {
   return true;
 }
 
+// Reads the body of a response that refused a WebSocket upgrade or a proxy
+// CONNECT, so the caller can see why. Best effort: the connection is closed
+// afterwards, so a body that is cut short, too long, or not decodable leaves
+// whatever was read (at most CPPHTTPLIB_WEBSOCKET_HANDSHAKE_BODY_MAX_LENGTH
+// bytes) and is not an error.
+inline void read_rejection_body(Stream &strm, int status,
+                                const Headers &headers, std::string &body) {
+  // RFC 9110 6.4.1: these responses never carry content.
+  if (status < 200 || status == StatusCode::NoContent_204 ||
+      status == StatusCode::NotModified_304) {
+    return;
+  }
+
+  const size_t limit = CPPHTTPLIB_WEBSOCKET_HANDSHAKE_BODY_MAX_LENGTH;
+  Response res;
+  res.headers = headers;
+  int dummy_status = status;
+  read_content(
+      strm, res, (std::numeric_limits<size_t>::max)(), dummy_status, nullptr,
+      [&](const char *buf, size_t n, size_t, size_t) {
+        body.append(buf, (std::min)(n, limit - body.size()));
+        return body.size() < limit;
+      },
+      true);
+}
+
 inline bool perform_websocket_handshake(Stream &strm, Request &req,
                                         WebSocketUpgradeResponse &upgrade) {
   // Generate a random 16-byte Sec-WebSocket-Key (RFC 6455 Section 4.1)
@@ -10707,8 +10746,15 @@ inline bool perform_websocket_handshake(Stream &strm, Request &req,
   auto expected_accept = websocket_accept_key(client_key);
   auto offered_subprotocols =
       get_combined_header_value(req.headers, "Sec-WebSocket-Protocol");
-  return read_websocket_upgrade_response(strm, expected_accept,
-                                         offered_subprotocols, upgrade);
+  if (read_websocket_upgrade_response(strm, expected_accept,
+                                      offered_subprotocols, upgrade)) {
+    return true;
+  }
+  if (upgrade.status != -1 &&
+      upgrade.status != StatusCode::SwitchingProtocol_101) {
+    read_rejection_body(strm, upgrade.status, upgrade.headers, upgrade.body);
+  }
+  return false;
 }
 
 inline bool is_ip_address(const std::string &host) {
@@ -24005,7 +24051,8 @@ inline Result WebSocketClient::connect() {
     Response proxy_res;
     if (!connect_with_proxy(proxy_res, error)) {
       shutdown_and_close();
-      return Result{error, proxy_res.status, std::move(proxy_res.headers)};
+      return Result{error, proxy_res.status, std::move(proxy_res.headers),
+                    std::move(proxy_res.body)};
     }
   }
 
@@ -24031,7 +24078,8 @@ inline Result WebSocketClient::connect() {
   detail::WebSocketUpgradeResponse upgrade;
   if (!detail::perform_websocket_handshake(*strm, req, upgrade)) {
     shutdown_and_close();
-    return Result{upgrade.error, upgrade.status, std::move(upgrade.headers)};
+    return Result{upgrade.error, upgrade.status, std::move(upgrade.headers),
+                  std::move(upgrade.body)};
   }
   subprotocol_ = std::move(upgrade.selected_subprotocol);
 
@@ -24167,6 +24215,13 @@ inline bool WebSocketClient::send_proxy_connect(Request &req,
   if (!detail::read_response_head(strm, proxy_res.status, proxy_res.headers)) {
     error = Error::Read;
     return false;
+  }
+  // A 2xx reply opens the tunnel and has no body (RFC 9110 9.3.6). Any other
+  // reply's body is read so a refusal can be reported.
+  if (proxy_res.status != -1 &&
+      (proxy_res.status < 200 || proxy_res.status >= 300)) {
+    detail::read_rejection_body(strm, proxy_res.status, proxy_res.headers,
+                                proxy_res.body);
   }
   return true;
 }

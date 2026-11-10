@@ -183,6 +183,11 @@ bool is_valid() const;
 //                           or of the proxy's CONNECT reply when error() is
 //                           Error::ProxyConnection
 //   res.headers()           headers of that same response
+//   res.body()              body of that response when the upgrade (or
+//                           CONNECT) was refused, e.g. a JSON error; empty
+//                           otherwise. Truncated to
+//                           CPPHTTPLIB_WEBSOCKET_HANDSHAKE_BODY_MAX_LENGTH
+//                           (64KB by default)
 //   res.get_header_value(key, def), res.has_header(key)
 //                           look up one of those headers
 //   res.ssl_error()         TLS error detail (wss://, SSL builds only)
@@ -297,7 +302,8 @@ proxy problems (`ProxyConnection`), TLS problems (`SSLConnection`,
 rejections (`WebSocketHandshake`). `WebSocketHandshake` covers a status other
 than `101 Switching Protocols` as well as a `101` that fails validation (for
 example a wrong `Sec-WebSocket-Accept`); either way `status()` and `headers()`
-carry the server's response. When a proxy refuses the `CONNECT` request, the
+carry the server's response, and when the status is not `101`, `body()` carries
+its body (for example an error message explaining an authentication failure). When a proxy refuses the `CONNECT` request, the
 error is `ProxyConnection` and they carry the proxy's reply instead (e.g. 407):
 
 ```cpp
@@ -308,6 +314,7 @@ if (!res) {
         // The server refused the upgrade (e.g. 401, 404, or an invalid 101),
         // or, with ProxyConnection, the proxy refused CONNECT (e.g. 407)
         std::cerr << "HTTP status: " << res.status() << std::endl;
+        std::cerr << "body: " << res.body() << std::endl;
     }
 }
 ```
